@@ -21,6 +21,7 @@ type MockStore struct {
 	apiKeys            []APIKey
 	watchlist          map[string]map[string]bool
 	alertSubscriptions []AlertSubscription
+	users              map[string]User
 
 	// Error injection
 	UpsertContractErr   error
@@ -34,17 +35,20 @@ type MockStore struct {
 	RecentEventsErr     error
 	CreateAPIKeyErr     error
 	GetAPIKeyErr        error
+	UpsertUserErr       error
+	GetUserErr          error
 }
 
 // NewMockStore returns an initialized MockStore.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		contracts:  make(map[string]Contract),
-		syncStates: make(map[string]SyncState),
-		monitored:  make(map[string]MonitoredContract),
-		watchlist:  make(map[string]map[string]bool),
-		alerts:     make([]ContractAlert, 0),
+		contracts:          make(map[string]Contract),
+		syncStates:         make(map[string]SyncState),
+		monitored:          make(map[string]MonitoredContract),
+		watchlist:          make(map[string]map[string]bool),
+		alerts:             make([]ContractAlert, 0),
 		alertSubscriptions: make([]AlertSubscription, 0),
+		users:              make(map[string]User),
 	}
 }
 
@@ -143,7 +147,9 @@ func (m *MockStore) SetGlobalStats(gs GlobalStats) {
 
 func (m *MockStore) CreateNextMonthPartition(_ context.Context) error { return nil }
 
-func (m *MockStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error { return nil }
+func (m *MockStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error {
+	return nil
+}
 
 // ---- store.QueryStore -------------------------------------------------------
 
@@ -502,6 +508,68 @@ func (m *MockStore) ListWatchlist(_ context.Context, userID string) ([]string, e
 
 func (m *MockStore) IsInWatchlist(_ context.Context, userID, contractID string) (bool, error) {
 	return m.watchlist[userID][contractID], nil
+}
+
+// ---- store.UserStore --------------------------------------------------------
+
+// AddUser is a test helper that seeds a user directly.
+func (m *MockStore) AddUser(u User) {
+	if u.CreatedAt.IsZero() {
+		u.CreatedAt = time.Now()
+	}
+	if u.Role == "" {
+		u.Role = RoleViewer
+	}
+	m.users[u.ID] = u
+}
+
+func (m *MockStore) UpsertUser(_ context.Context, u User) error {
+	if m.UpsertUserErr != nil {
+		return m.UpsertUserErr
+	}
+	existing, ok := m.users[u.ID]
+	if !ok {
+		if u.Role == "" {
+			u.Role = RoleViewer
+		}
+		if u.CreatedAt.IsZero() {
+			u.CreatedAt = time.Now()
+		}
+		m.users[u.ID] = u
+		return nil
+	}
+	// Preserve existing fields when the call does not supply a replacement.
+	if u.GitHubID != nil {
+		existing.GitHubID = u.GitHubID
+	}
+	if u.Role != "" {
+		existing.Role = u.Role
+	}
+	m.users[u.ID] = existing
+	return nil
+}
+
+func (m *MockStore) GetUserByID(_ context.Context, id string) (User, error) {
+	if m.GetUserErr != nil {
+		return User{}, m.GetUserErr
+	}
+	u, ok := m.users[id]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	return u, nil
+}
+
+func (m *MockStore) GetUserByGitHubID(_ context.Context, githubID string) (User, error) {
+	if m.GetUserErr != nil {
+		return User{}, m.GetUserErr
+	}
+	for _, u := range m.users {
+		if u.GitHubID != nil && *u.GitHubID == githubID {
+			return u, nil
+		}
+	}
+	return User{}, ErrNotFound
 }
 
 // ErrPing is returned by MockPinger when Healthy is false.
