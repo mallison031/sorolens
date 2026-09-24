@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -61,6 +62,16 @@ type ContractStats struct {
 	WindowDuration        string
 }
 
+// HourlyActivity holds one hour bucket of contract activity (hour start, UTC).
+// It backs the indexer's anomaly detector window (issue #136).
+type HourlyActivity struct {
+	Hour        time.Time // hour start, UTC
+	EventCount  int64
+	InvokeCount int64
+	CPU         int64 // sum of cpu_insn
+	Fees        int64 // sum of resource fees, stroops
+}
+
 // QueryStore provides read-only querying methods needed by the HTTP API.
 type QueryStore interface {
 	ListEvents(ctx context.Context, contractID, cursor string, limit int, f EventFilters) ([]Event, string, error)
@@ -81,6 +92,11 @@ type QueryStore interface {
 	// LastEventAtOrBefore returns the most recent event with ledger <= ledger,
 	// or ErrNotFound when the contract has no such event.
 	LastEventAtOrBefore(ctx context.Context, contractID string, ledger uint32) (Event, error)
+	// RecentHourlyActivity returns one row per hour bucket for the most recent
+	// `hours` hours (hour-start UTC, oldest first). Hours with no activity
+	// yield a zero bucket, providing a contiguous series to the indexer's
+	// anomaly detector.
+	RecentHourlyActivity(ctx context.Context, contractID string, hours int) ([]HourlyActivity, error)
 }
 
 // ---- ListEvents --------------------------------------------------------------
@@ -335,6 +351,69 @@ func (s *postgresStore) ContractFirstLedger(ctx context.Context, contractID stri
 		return 0, fmt.Errorf("contract first ledger: %w", err)
 	}
 	return first, nil
+}
+
+// RecentHourlyActivity queries the most recent `hours` hourly buckets
+// (oldest first), coalescing event counts from events and invocation/CPU/fee
+// totals from invocations. generate_series guarantees a zero bucket for every
+// hour even when the contract was idle, giving the indexer's anomaly detector
+// a contiguous baseline series.
+func (s *postgresStore) RecentHourlyActivity(ctx context.Context, contractID string, hours int) ([]HourlyActivity, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 24*31 {
+		hours = 24 * 31
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH buckets AS (
+			SELECT date_trunc('hour', d) AS hour
+			FROM generate_series(now() - ($2::int || ' hours')::interval, now(), '1 hour') AS d
+		)
+		SELECT b.hour,
+		       COALESCE(ev.events, 0)      AS events,
+		       COALESCE(inv.invocations, 0) AS invocations,
+		       COALESCE(inv.cpu, 0)         AS cpu,
+		       COALESCE(inv.fees, 0)        AS fees
+		FROM buckets b
+		LEFT JOIN (
+			SELECT date_trunc('hour', ledger_closed_at) AS hour,
+			       COUNT(*)                             AS events
+			FROM events
+			WHERE contract_id = $1
+			  AND ledger_closed_at >= now() - ($2::int || ' hours')::interval
+			GROUP BY 1
+		) ev ON ev.hour = b.hour
+		LEFT JOIN (
+			SELECT date_trunc('hour', ledger_closed_at) AS hour,
+			       COUNT(*)                             AS invocations,
+			       COALESCE(SUM(cpu_insn), 0)           AS cpu,
+			       COALESCE(SUM(resource_fee_charged), 0) AS fees
+			FROM invocations
+			WHERE contract_id = $1
+			  AND ledger_closed_at >= now() - ($2::int || ' hours')::interval
+			GROUP BY 1
+		) inv ON inv.hour = b.hour
+		ORDER BY b.hour ASC`,
+		contractID, hours,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("hourly activity: %w", err)
+	}
+	defer rows.Close()
+
+	var out []HourlyActivity
+	for rows.Next() {
+		var a HourlyActivity
+		var cpu, fees float64
+		if err := rows.Scan(&a.Hour, &a.EventCount, &a.InvokeCount, &cpu, &fees); err != nil {
+			return nil, fmt.Errorf("hourly activity scan: %w", err)
+		}
+		a.CPU = int64(cpu)
+		a.Fees = int64(fees)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // ---- GetStorageSnapshot -----------------------------------------------------
