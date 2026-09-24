@@ -23,6 +23,15 @@ type Store interface {
 	UpsertSyncState(ctx context.Context, s SyncState) error
 	CreateNextMonthPartition(ctx context.Context) error
 	CreateMonthlyPartitionIfNotExists(ctx context.Context, year int, month int) error
+
+	// RecentHourlyActivity returns per-hour activity buckets for the most
+	// recent `hours` hours (oldest first), aggregated across events and
+	// invocations. Used by the anomaly detector to build a rolling baseline.
+	RecentHourlyActivity(ctx context.Context, contractID string, hours int) ([]HourlyActivity, error)
+	// InsertAlert persists an anomaly/health alert row (severity Warning for
+	// anomaly spikes). Implementations may de-duplicate on (tx_hash,
+	// contract_id).
+	InsertAlert(ctx context.Context, a Alert) error
 }
 
 // RedisClient is the subset of Redis operations the poller needs for advisory locks.
@@ -118,4 +127,25 @@ type Invocation struct {
 type SyncState struct {
 	ContractID string
 	LastLedger uint32
+}
+
+// HourlyActivity is one per-hour aggregate bucket for a contract, used by the
+// anomaly detector. CPU and fees are totals over the hour.
+type HourlyActivity struct {
+	Hour        time.Time // bucket start, UTC
+	EventCount  int64
+	InvokeCount int64
+	CPU         int64 // sum of cpu_insn
+	Fees        int64 // sum of resource fees, stroops
+}
+
+// Alert mirrors store.ContractAlert. TxHash carries a synthetic, deterministic
+// key (see anomaly job) so implementations can de-duplicate re-runs.
+type Alert struct {
+	ContractID string
+	Severity   string // Info | Warning | Critical
+	Message    string
+	Ledger     int64
+	TxHash     string
+	Timestamp  time.Time
 }

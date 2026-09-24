@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sorolens/sorolens/services/indexer/internal/anomaly"
 	"github.com/sorolens/sorolens/services/indexer/internal/partition"
 )
 
@@ -40,6 +41,16 @@ type Config struct {
 	// MaxDuration is the wall-clock budget for a single once-mode pass.
 	// If a pass exceeds this, the poller logs a warning and exits cleanly.
 	MaxDuration time.Duration
+
+	// AnomalyEnabled turns the per-pass anomaly detection job on (default off;
+	// issue #136). Indexer main.go wires it via env.
+	AnomalyEnabled bool
+	// AnomalyLookbackHours is the rolling baseline window, default 168 (7 days).
+	AnomalyLookbackHours int
+	// AnomalySigma is the standard-deviation threshold, default 3.
+	AnomalySigma float64
+	// AnomalyMinHistory is the minimum samples before detection starts.
+	AnomalyMinHistory int
 }
 
 // Poller fetches and persists events and invocations for all tracked contracts.
@@ -159,7 +170,127 @@ func (p *Poller) processAll(ctx context.Context) error {
 		}
 		cursor = next
 	}
+
+	if p.cfg.AnomalyEnabled {
+		p.runAnomalyDetection(ctx)
+	}
 	return nil
+}
+
+// alertTxKey builds the deterministic de-duplication key for an anomaly alert.
+// The contract_alerts table de-duplicates on (tx_hash, contract_id), so this
+// synthetic key prevents re-inserting the same alert on every 5-minute pass.
+func alertTxKey(metric string, ref time.Time) string {
+	return fmt.Sprintf("anomaly:%s:%s", metric, ref.UTC().Format("2006-01-02T15"))
+}
+
+// runAnomalyDetection is the periodic anomaly-detection job (issue #136).
+// For every active contract it builds a rolling baseline of per-hour activity
+// and inserts a Warning contract alert for each metric that spikes more than
+// AnomalySigma standard deviations above its mean.
+//
+// The job is best-effort: store or detection errors are logged and never
+// block the indexing pass. It respects context cancellation so the 5-minute
+// cadence in continuous mode and once-mode shutdown both behave cleanly.
+func (p *Poller) runAnomalyDetection(ctx context.Context) {
+	start := time.Now()
+	samplesByContract := make(map[string][]anomaly.Sample)
+
+	var cursor string
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		contracts, next, err := p.store.ListContracts(ctx, cursor, 50)
+		if err != nil {
+			p.log.Error("anomaly: list contracts", "err", err)
+			return
+		}
+		for _, c := range contracts {
+			if ctx.Err() != nil {
+				return
+			}
+			if c.Status != "active" && c.Status != "backfilling" {
+				continue
+			}
+			samples, err := p.hourlyActivity(ctx, c.ID)
+			if err != nil {
+				p.log.Warn("anomaly: fetch hourly activity",
+					"contract_id", c.ID,
+					"err", err,
+				)
+				continue
+			}
+			samplesByContract[c.ID] = samples
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+
+	var detected int
+	for contractID, samples := range samplesByContract {
+		cfg := anomaly.Config{
+			Sigma:      p.cfg.AnomalySigma,
+			MinHistory: p.cfg.AnomalyMinHistory,
+		}
+		for _, a := range anomaly.Detect(samples, cfg) {
+			alert := Alert{
+				ContractID: contractID,
+				Severity:   "Warning",
+				Message:    a.Message,
+				Ledger:     0,
+				TxHash:     alertTxKey(a.Metric, a.At),
+				Timestamp:  time.Now().UTC(),
+			}
+			if err := p.store.InsertAlert(ctx, alert); err != nil {
+				p.log.Warn("anomaly: insert alert",
+					"contract_id", contractID,
+					"metric", a.Metric,
+					"err", err,
+				)
+				continue
+			}
+			detected++
+			p.log.Warn("anomaly detected",
+				"contract_id", contractID,
+				"metric", a.Metric,
+				"observed", a.Observed,
+				"threshold", a.Expected,
+			)
+		}
+	}
+
+	p.log.Info("anomaly detection pass complete",
+		"contracts", len(samplesByContract),
+		"alerts", detected,
+		"duration", time.Since(start),
+	)
+}
+
+// hourlyActivity fetches the rolling window of per-hour activity for a
+// contract and converts it to the detector's sample format (oldest first).
+func (p *Poller) hourlyActivity(ctx context.Context, contractID string) ([]anomaly.Sample, error) {
+	lookback := p.cfg.AnomalyLookbackHours
+	if lookback <= 0 {
+		lookback = anomaly.DefaultLookbackHours
+	}
+	buckets, err := p.store.RecentHourlyActivity(ctx, contractID, lookback)
+	if err != nil {
+		return nil, err
+	}
+	samples := make([]anomaly.Sample, 0, len(buckets))
+	for _, b := range buckets {
+		samples = append(samples, anomaly.Sample{
+			At:          b.Hour,
+			Events:      float64(b.EventCount),
+			Invocations: float64(b.InvokeCount),
+			CPU:         float64(b.CPU),
+			Fees:        float64(b.Fees),
+		})
+	}
+	return samples, nil
 }
 
 // processContract indexes all new events for one contract.
