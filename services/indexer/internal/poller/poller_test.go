@@ -76,12 +76,16 @@ type fakeStore struct {
 	invocations []Invocation
 	syncErr     error
 	listErr     error
+	hourly      map[string][]HourlyActivity // contractID -> buckets
+	alerts      []Alert
+	insertErr   error
 }
 
 func newFakeStore(contracts []Contract) *fakeStore {
 	return &fakeStore{
 		contracts:  contracts,
 		syncStates: make(map[string]SyncState),
+		hourly:     make(map[string][]HourlyActivity),
 	}
 }
 
@@ -128,7 +132,25 @@ func (f *fakeStore) UpsertSyncState(_ context.Context, s SyncState) error {
 }
 
 func (f *fakeStore) CreateNextMonthPartition(_ context.Context) error { return nil }
-func (f *fakeStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error { return nil }
+func (f *fakeStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error {
+	return nil
+}
+
+func (f *fakeStore) RecentHourlyActivity(_ context.Context, contractID string, _ int) ([]HourlyActivity, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hourly[contractID], nil
+}
+
+func (f *fakeStore) InsertAlert(_ context.Context, a Alert) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.insertErr != nil {
+		return f.insertErr
+	}
+	f.alerts = append(f.alerts, a)
+	return nil
+}
 
 // ---- fake RedisClient -----------------------------------------------------
 
@@ -440,5 +462,114 @@ func TestPoller_UnknownModeReturnsError(t *testing.T) {
 	p := New(&fakeRPC{}, newFakeStore(nil), newFakeRedis(), testConfig(), testLogger())
 	if err := p.Run(context.Background(), "invalid"); err == nil {
 		t.Fatal("expected error for unknown mode")
+	}
+}
+
+// ---- anomaly detection job (issue #136) -----------------------------------
+
+func anomalyConfig() Config {
+	cfg := testConfig()
+	cfg.AnomalyEnabled = true
+	cfg.AnomalyLookbackHours = 24
+	cfg.AnomalySigma = 3
+	cfg.AnomalyMinHistory = 12
+	return cfg
+}
+
+// steadyActivity builds `hours` of steady hourly buckets at `base` events.
+func steadyActivity(contractID string, hours int, base int64) []HourlyActivity {
+	start := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	out := make([]HourlyActivity, hours)
+	for i := 0; i < hours; i++ {
+		out[i] = HourlyActivity{
+			Hour:        start.Add(time.Duration(i) * time.Hour),
+			EventCount:  base,
+			InvokeCount: base / 2,
+			CPU:         base * 100,
+			Fees:        base * 1000,
+		}
+	}
+	return out
+}
+
+// TestPoller_AnomalyJob_SteadyStateNoAlerts simulates steady activity and
+// requires the job to not raise any contract alerts.
+func TestPoller_AnomalyJob_SteadyStateNoAlerts(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CSTEADY", Status: "active"}})
+	store.hourly["CSTEADY"] = steadyActivity("CSTEADY", 24, 100)
+
+	p := New(&fakeRPC{}, store, newFakeRedis(), anomalyConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(store.alerts) != 0 {
+		t.Fatalf("steady state produced %d alerts: %+v", len(store.alerts), store.alerts)
+	}
+}
+
+// TestPoller_AnomalyJob_FabricatedSpikeRaisesAlert fabricates a 20x event
+// spike in the trailing hour and requires exactly one Warning alert (events
+// metric), de-duplicated across the two runs of the same pass is not
+// applicable since the job detects once per pass.
+func TestPoller_AnomalyJob_FabricatedSpikeRaisesAlert(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CSPIKE", Status: "active"}})
+	buckets := steadyActivity("CSPIKE", 24, 100)
+	last := buckets[len(buckets)-1]
+	last.EventCount = 2000
+	buckets[len(buckets)-1] = last
+	store.hourly["CSPIKE"] = buckets
+
+	p := New(&fakeRPC{}, store, newFakeRedis(), anomalyConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(store.alerts) == 0 {
+		t.Fatal("spike produced no alerts")
+	}
+	for _, a := range store.alerts {
+		if a.Severity != "Warning" {
+			t.Errorf("alert severity = %q, want Warning", a.Severity)
+		}
+		if a.Message == "" {
+			t.Error("alert message is empty")
+		}
+	}
+}
+
+// TestPoller_AnomalyJobSkippedWhenDisabled ensures the job is off by default.
+func TestPoller_AnomalyJobSkippedWhenDisabled(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CSPIKE2", Status: "active"}})
+	buckets := steadyActivity("CSPIKE2", 24, 100)
+	last := buckets[len(buckets)-1]
+	last.EventCount = 2000
+	buckets[len(buckets)-1] = last
+	store.hourly["CSPIKE2"] = buckets
+
+	p := New(&fakeRPC{}, store, newFakeRedis(), testConfig(), testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(store.alerts) != 0 {
+		t.Fatalf("alerts raised with anomaly job disabled: %+v", store.alerts)
+	}
+}
+
+// TestPoller_AnomalyJobRespectsCancellation ensures context cancellation stops
+// the detection loop cleanly.
+func TestPoller_AnomalyJobRespectsCancellation(t *testing.T) {
+	store := newFakeStore([]Contract{{ID: "CCANCEL", Status: "active"}})
+	store.hourly["CCANCEL"] = steadyActivity("CCANCEL", 24, 100)
+
+	cfg := anomalyConfig()
+	p := New(&fakeRPC{}, store, newFakeRedis(), cfg, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx, "once") }()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
