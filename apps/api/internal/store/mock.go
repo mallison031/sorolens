@@ -39,11 +39,11 @@ type MockStore struct {
 // NewMockStore returns an initialized MockStore.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		contracts:  make(map[string]Contract),
-		syncStates: make(map[string]SyncState),
-		monitored:  make(map[string]MonitoredContract),
-		watchlist:  make(map[string]map[string]bool),
-		alerts:     make([]ContractAlert, 0),
+		contracts:          make(map[string]Contract),
+		syncStates:         make(map[string]SyncState),
+		monitored:          make(map[string]MonitoredContract),
+		watchlist:          make(map[string]map[string]bool),
+		alerts:             make([]ContractAlert, 0),
 		alertSubscriptions: make([]AlertSubscription, 0),
 	}
 }
@@ -143,7 +143,9 @@ func (m *MockStore) SetGlobalStats(gs GlobalStats) {
 
 func (m *MockStore) CreateNextMonthPartition(_ context.Context) error { return nil }
 
-func (m *MockStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error { return nil }
+func (m *MockStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error {
+	return nil
+}
 
 // ---- store.QueryStore -------------------------------------------------------
 
@@ -270,6 +272,54 @@ func (m *MockStore) GetContractStats(_ context.Context, contractID, window strin
 		}
 	}
 	return cs, nil
+}
+
+// RecentHourlyActivity returns hourly buckets (oldest first) for the most
+// recent `hours` hours, mirroring the postgres query with zero-fill.
+func (m *MockStore) RecentHourlyActivity(_ context.Context, contractID string, hours int) ([]HourlyActivity, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	now := time.Now().UTC()
+	start := now.Add(-time.Duration(hours) * time.Hour)
+	hourOf := func(t time.Time) time.Time {
+		y, mo, d := t.UTC().Date()
+		return time.Date(y, mo, d, t.Hour(), 0, 0, 0, time.UTC)
+	}
+
+	evByHour := map[time.Time]int64{}
+	for _, e := range m.events {
+		if e.ContractID != contractID || e.LedgerClosedAt.Before(start) {
+			continue
+		}
+		evByHour[hourOf(e.LedgerClosedAt)]++
+	}
+
+	invByHour := map[time.Time]int64{}
+	cpuByHour := map[time.Time]int64{}
+	feeByHour := map[time.Time]int64{}
+	for _, inv := range m.invocations {
+		if inv.ContractID != contractID || inv.LedgerClosedAt.Before(start) {
+			continue
+		}
+		h := hourOf(inv.LedgerClosedAt)
+		invByHour[h]++
+		cpuByHour[h] += inv.CPUInsn
+		feeByHour[h] += inv.ResourceFeeCharged
+	}
+
+	var out []HourlyActivity
+	for i := hours - 1; i >= 0; i-- {
+		h := hourOf(now.Add(-time.Duration(i) * time.Hour))
+		out = append(out, HourlyActivity{
+			Hour:        h,
+			EventCount:  evByHour[h],
+			InvokeCount: invByHour[h],
+			CPU:         cpuByHour[h],
+			Fees:        feeByHour[h],
+		})
+	}
+	return out, nil
 }
 
 func (m *MockStore) RecentEvents(_ context.Context, contractID string, limit int) ([]Event, error) {
