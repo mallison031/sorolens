@@ -274,6 +274,51 @@ func (m *MockStore) GetContractStats(_ context.Context, contractID, window strin
 	return cs, nil
 }
 
+// DailyAggregates aggregates the in-memory events/invocations into per-day
+// buckets (midnight UTC). Mirrors the postgres generate_series behaviour:
+// every day in the window appears, empty days as zeroes.
+func (m *MockStore) DailyAggregates(_ context.Context, contractID string, days int) ([]DailyAggregate, error) {
+	if days <= 0 {
+		days = 90
+	}
+	now := time.Now().UTC()
+	start := now.AddDate(0, 0, -days)
+	dayOf := func(t time.Time) time.Time {
+		y, mo, d := t.UTC().Date()
+		return time.Date(y, mo, d, 0, 0, 0, 0, time.UTC)
+	}
+
+	feeByDay := map[time.Time]float64{}
+	invByDay := map[time.Time]float64{}
+	for _, inv := range m.invocations {
+		if inv.ContractID != contractID || inv.LedgerClosedAt.Before(start) {
+			continue
+		}
+		feeByDay[dayOf(inv.LedgerClosedAt)] += float64(inv.ResourceFeeCharged)
+		invByDay[dayOf(inv.LedgerClosedAt)]++
+	}
+
+	evByDay := map[time.Time]float64{}
+	for _, e := range m.events {
+		if e.ContractID != contractID || e.LedgerClosedAt.Before(start) {
+			continue
+		}
+		evByDay[dayOf(e.LedgerClosedAt)]++
+	}
+
+	var out []DailyAggregate
+	for i := days - 1; i >= 0; i-- {
+		d := dayOf(now.AddDate(0, 0, -i))
+		out = append(out, DailyAggregate{
+			Day:         d,
+			Fee:         feeByDay[d],
+			Invocations: invByDay[d],
+			Events:      evByDay[d],
+		})
+	}
+	return out, nil
+}
+
 // RecentHourlyActivity returns hourly buckets (oldest first) for the most
 // recent `hours` hours, mirroring the postgres query with zero-fill.
 func (m *MockStore) RecentHourlyActivity(_ context.Context, contractID string, hours int) ([]HourlyActivity, error) {

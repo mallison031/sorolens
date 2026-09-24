@@ -72,6 +72,17 @@ type HourlyActivity struct {
 	Fees        int64 // sum of resource fees, stroops
 }
 
+// DailyAggregate holds one calendar day of contract activity. Fees are the
+// sum of resource fees charged across invocations (stroops). The forecast
+// feature fits trend + weekly seasonality over these cheap aggregate scans
+// rather than over raw rows.
+type DailyAggregate struct {
+	Day         time.Time // midnight UTC
+	Fee         float64
+	Invocations float64
+	Events      float64
+}
+
 // QueryStore provides read-only querying methods needed by the HTTP API.
 type QueryStore interface {
 	ListEvents(ctx context.Context, contractID, cursor string, limit int, f EventFilters) ([]Event, string, error)
@@ -92,6 +103,11 @@ type QueryStore interface {
 	// LastEventAtOrBefore returns the most recent event with ledger <= ledger,
 	// or ErrNotFound when the contract has no such event.
 	LastEventAtOrBefore(ctx context.Context, contractID string, ledger uint32) (Event, error)
+	// DailyAggregates returns one row per calendar day for the most recent
+	// `days` days (midnight UTC buckets), oldest first. Days with no activity
+	// yield a zero aggregate rather than a gap, so the forecasting model can
+	// fit a contiguous series.
+	DailyAggregates(ctx context.Context, contractID string, days int) ([]DailyAggregate, error)
 	// RecentHourlyActivity returns one row per hour bucket for the most recent
 	// `hours` hours (hour-start UTC, oldest first). Hours with no activity
 	// yield a zero bucket, providing a contiguous series to the indexer's
